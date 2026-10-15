@@ -1,0 +1,929 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write project files
+        run: |
+          mkdir -p proj/app proj/app/src/main proj/app/src/main/java/app/jeongdap proj/app/src/main/res/drawable proj/app/src/main/res/layout proj/app/src/main/res/mipmap-anydpi-v26 proj/app/src/main/res/values proj/app/src/main/res/values-night proj/app/src/main/res/xml
+          cat > 'proj/app/build.gradle.kts' << 'EOF_FILE'
+          plugins {
+              id("com.android.application")
+          }
+
+          android {
+              namespace = "app.jeongdap"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "app.jeongdap"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              packaging {
+                  resources {
+                      excludes += setOf(
+                          "META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA",
+                          "META-INF/versions/**", "META-INF/LICENSE*", "META-INF/NOTICE*"
+                      )
+                  }
+              }
+
+              lint {
+                  abortOnError = false
+                  checkReleaseBuilds = false
+              }
+          }
+
+          dependencies {
+              implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+          }
+          EOF_FILE
+          cat > 'proj/app/src/main/AndroidManifest.xml' << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="정답 지우개"
+                  android:largeHeap="true"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density"
+                      android:exported="true"
+                      android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter android:label="정답 지우기">
+                          <action android:name="android.intent.action.SEND" />
+                          <action android:name="android.intent.action.SEND_MULTIPLE" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="application/pdf" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver
+                      android:name=".EraserWidget"
+                      android:exported="false"
+                      android:label="정답 지우기">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.appwidget.provider"
+                          android:resource="@xml/widget_info" />
+                  </receiver>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > 'proj/app/src/main/java/app/jeongdap/EraserWidget.java' << 'EOF_FILE'
+          package app.jeongdap;
+
+          import android.app.PendingIntent;
+          import android.appwidget.AppWidgetManager;
+          import android.appwidget.AppWidgetProvider;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.widget.RemoteViews;
+
+          public class EraserWidget extends AppWidgetProvider {
+              @Override
+              public void onUpdate(Context c, AppWidgetManager m, int[] ids) {
+                  Intent i = new Intent(c, MainActivity.class)
+                          .setAction(MainActivity.ACTION_PICK)
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  PendingIntent pi = PendingIntent.getActivity(c, 0, i,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  for (int id : ids) {
+                      RemoteViews v = new RemoteViews(c.getPackageName(), R.layout.widget);
+                      v.setOnClickPendingIntent(R.id.root, pi);
+                      m.updateAppWidget(id, v);
+                  }
+              }
+          }
+          EOF_FILE
+          cat > 'proj/app/src/main/java/app/jeongdap/MainActivity.java' << 'EOF_FILE'
+          package app.jeongdap;
+
+          import android.app.Activity;
+          import android.content.ActivityNotFoundException;
+          import android.content.ClipData;
+          import android.content.ContentResolver;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.provider.OpenableColumns;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.ProgressBar;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import com.tom_roush.pdfbox.android.PDFBoxResourceLoader;
+
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+
+              public static final String ACTION_PICK = "app.jeongdap.PICK";
+              private static final int REQ_PICK = 1;
+              private static volatile boolean busy = false;
+
+              private TextView status;
+              private ProgressBar bar;
+              private Button pick;
+              private Button open;
+              private EditText spot;
+              private volatile Uri lastOut;
+              private boolean fromWidget;
+
+              @Override
+              protected void onCreate(Bundle saved) {
+                  super.onCreate(saved);
+                  setContentView(R.layout.activity_main);
+                  status = findViewById(R.id.status);
+                  bar = findViewById(R.id.bar);
+                  pick = findViewById(R.id.pick);
+                  open = findViewById(R.id.open);
+                  spot = findViewById(R.id.spot);
+                  spot.setText(getSharedPreferences("cfg", MODE_PRIVATE).getString("spot", "teacher"));
+                  pick.setOnClickListener(v -> openPicker());
+                  open.setOnClickListener(v -> openResult());
+                  if (saved == null) handle(getIntent());
+              }
+
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  setIntent(intent);
+                  handle(intent);
+              }
+
+              @SuppressWarnings("deprecation")
+              private void handle(Intent i) {
+                  if (i == null || i.getAction() == null) return;
+                  String a = i.getAction();
+                  if (ACTION_PICK.equals(a)) {
+                      fromWidget = true;
+                      openPicker();
+                  } else if (Intent.ACTION_SEND.equals(a)) {
+                      Uri u = i.getParcelableExtra(Intent.EXTRA_STREAM);
+                      if (u != null) {
+                          List<Uri> l = new ArrayList<>();
+                          l.add(u);
+                          start(l);
+                      }
+                  } else if (Intent.ACTION_SEND_MULTIPLE.equals(a)) {
+                      ArrayList<Uri> l = i.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+                      if (l != null && !l.isEmpty()) start(l);
+                  }
+              }
+
+              @SuppressWarnings("deprecation")
+              private void openPicker() {
+                  if (busy) {
+                      Toast.makeText(this, "지금 처리 중이다. 끝나고 다시.", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                  i.setType("application/pdf");
+                  i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                  startActivityForResult(i, REQ_PICK);
+              }
+
+              @Override
+              @SuppressWarnings("deprecation")
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req != REQ_PICK) return;
+                  List<Uri> uris = new ArrayList<>();
+                  if (res == RESULT_OK && data != null) {
+                      ClipData clip = data.getClipData();
+                      if (clip != null) {
+                          for (int k = 0; k < clip.getItemCount(); k++) uris.add(clip.getItemAt(k).getUri());
+                      } else if (data.getData() != null) {
+                          uris.add(data.getData());
+                      }
+                  }
+                  if (!uris.isEmpty()) {
+                      start(uris);
+                  } else if (fromWidget && !busy) {
+                      finish();
+                  }
+                  fromWidget = false;
+              }
+
+              private void start(List<Uri> uris) {
+                  if (busy) {
+                      Toast.makeText(this, "지금 처리 중이다. 끝나고 다시.", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  String name = spot.getText().toString().trim();
+                  if (name.isEmpty()) name = "teacher";
+                  getSharedPreferences("cfg", MODE_PRIVATE).edit().putString("spot", name).apply();
+                  busy = true;
+                  lastOut = null;
+                  pick.setEnabled(false);
+                  open.setVisibility(View.GONE);
+                  bar.setVisibility(View.VISIBLE);
+                  bar.setProgress(0);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  final String spotName = name;
+                  new Thread(() -> work(uris, spotName), "eraser").start();
+              }
+
+              private void work(List<Uri> uris, String spotName) {
+                  StringBuilder log = new StringBuilder();
+                  File cache = getCacheDir();
+                  try {
+                      PDFBoxResourceLoader.init(getApplicationContext());
+                  } catch (Throwable ignored) {
+                  }
+                  for (int k = 0; k < uris.size(); k++) {
+                      Uri u = uris.get(k);
+                      String name = displayName(u);
+                      String base = name.toLowerCase().endsWith(".pdf") ? name.substring(0, name.length() - 4) : name;
+                      final String head = (uris.size() > 1 ? "(" + (k + 1) + "/" + uris.size() + ") " : "") + name;
+                      ui(head + "\n복사 중…", 0, 1);
+                      File in = new File(cache, "in.pdf");
+                      File out = new File(cache, "out.pdf");
+                      try {
+                          InputStream is = getContentResolver().openInputStream(u);
+                          if (is == null) throw new IOException("파일을 못 열었다");
+                          copy(is, new FileOutputStream(in));
+                          Stripper.Result r = Stripper.run(in, out, spotName, cache,
+                                  (d, n) -> ui(head + "\n" + d + " / " + n + "쪽", d, n));
+                          if (r.removed() == 0) {
+                              log.append("✗ ").append(name).append("\n   '").append(spotName)
+                                      .append("' 색을 못 찾았다. 이 PDF의 별색: ")
+                                      .append(r.spots.isEmpty() ? "없음" : String.join(", ", r.spots))
+                                      .append("\n\n");
+                          } else {
+                              ui(head + "\n저장 중…", 1, 1);
+                              Uri saved = saveToDownloads(out, base + "_학생용.pdf");
+                              lastOut = saved;
+                              log.append("✓ ").append(base).append("_학생용.pdf\n   ")
+                                      .append(r.pages).append("쪽, 정답 ").append(r.removed()).append("곳 지움\n\n");
+                          }
+                      } catch (OutOfMemoryError e) {
+                          log.append("✗ ").append(name).append("\n   메모리 부족. 다른 앱 닫고 다시.\n\n");
+                      } catch (Throwable e) {
+                          log.append("✗ ").append(name).append("\n   오류: ").append(e.getMessage() == null ? e.toString() : e.getMessage()).append("\n\n");
+                      } finally {
+                          in.delete();
+                          out.delete();
+                      }
+                  }
+                  final String text = log.append("저장 위치: Download/학생용").toString();
+                  runOnUiThread(() -> {
+                      busy = false;
+                      getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                      bar.setVisibility(View.GONE);
+                      pick.setEnabled(true);
+                      status.setText(text);
+                      if (lastOut != null) open.setVisibility(View.VISIBLE);
+                  });
+              }
+
+              private void ui(String text, int done, int total) {
+                  runOnUiThread(() -> {
+                      status.setText(text);
+                      bar.setMax(Math.max(total, 1));
+                      bar.setProgress(done);
+                  });
+              }
+
+              private String displayName(Uri u) {
+                  String name = null;
+                  try (Cursor c = getContentResolver().query(u, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                      if (c != null && c.moveToFirst()) name = c.getString(0);
+                  } catch (Exception ignored) {
+                  }
+                  if (name == null || name.isEmpty()) {
+                      String p = u.getLastPathSegment();
+                      name = p != null ? p.substring(p.lastIndexOf('/') + 1) : "교재.pdf";
+                  }
+                  return name;
+              }
+
+              private Uri saveToDownloads(File f, String name) throws IOException {
+                  ContentResolver cr = getContentResolver();
+                  ContentValues v = new ContentValues();
+                  v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                  v.put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf");
+                  v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/학생용");
+                  v.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                  Uri uri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                  if (uri == null) throw new IOException("Download 폴더에 저장 실패");
+                  OutputStream os = cr.openOutputStream(uri);
+                  if (os == null) throw new IOException("Download 폴더에 저장 실패");
+                  copy(new FileInputStream(f), os);
+                  v.clear();
+                  v.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                  cr.update(uri, v, null, null);
+                  return uri;
+              }
+
+              private void openResult() {
+                  if (lastOut == null) return;
+                  Intent i = new Intent(Intent.ACTION_VIEW);
+                  i.setDataAndType(lastOut, "application/pdf");
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                  try {
+                      startActivity(i);
+                  } catch (ActivityNotFoundException e) {
+                      Toast.makeText(this, "PDF 뷰어가 없다", Toast.LENGTH_SHORT).show();
+                  }
+              }
+
+              private static void copy(InputStream is, OutputStream os) throws IOException {
+                  try (InputStream in = is; OutputStream out = os) {
+                      byte[] buf = new byte[1 << 16];
+                      int n;
+                      while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                  }
+              }
+          }
+          EOF_FILE
+          cat > 'proj/app/src/main/java/app/jeongdap/Stripper.java' << 'EOF_FILE'
+          package app.jeongdap;
+
+          import com.tom_roush.pdfbox.contentstream.operator.Operator;
+          import com.tom_roush.pdfbox.cos.COSArray;
+          import com.tom_roush.pdfbox.cos.COSBase;
+          import com.tom_roush.pdfbox.cos.COSDictionary;
+          import com.tom_roush.pdfbox.cos.COSInteger;
+          import com.tom_roush.pdfbox.cos.COSName;
+          import com.tom_roush.pdfbox.cos.COSNumber;
+          import com.tom_roush.pdfbox.cos.COSObject;
+          import com.tom_roush.pdfbox.cos.COSStream;
+          import com.tom_roush.pdfbox.io.MemoryUsageSetting;
+          import com.tom_roush.pdfbox.pdfparser.PDFStreamParser;
+          import com.tom_roush.pdfbox.pdfwriter.ContentStreamWriter;
+          import com.tom_roush.pdfbox.pdmodel.PDDocument;
+          import com.tom_roush.pdfbox.pdmodel.PDPage;
+          import com.tom_roush.pdfbox.pdmodel.common.PDStream;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.Deque;
+          import java.util.HashSet;
+          import java.util.IdentityHashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.TreeSet;
+
+          /** 교사용 PDF에서 지정한 별색(Separation)으로 칠한 것만 지운다. */
+          public class Stripper {
+
+              public interface Progress {
+                  void onPage(int done, int total);
+              }
+
+              public static class Result {
+                  public int text, path, other, pages;
+                  /** PDF 안에서 본 별색 이름들 (CMYK 기본색 제외) */
+                  public final Set<String> spots = new TreeSet<String>();
+
+                  public int removed() {
+                      return text + path + other;
+                  }
+              }
+
+              public static Result run(File in, File out, String spotName, File tempDir, Progress progress)
+                      throws IOException {
+                  Stripper s = new Stripper(COSName.getPDFName(spotName));
+                  MemoryUsageSetting mem = MemoryUsageSetting.setupMixed(32L * 1024 * 1024);
+                  if (tempDir != null) mem.setTempDir(tempDir);
+                  PDDocument doc = PDDocument.load(in, mem);
+                  try {
+                      doc.setAllSecurityToBeRemoved(true);
+                      int total = doc.getNumberOfPages();
+                      s.result.pages = total;
+                      int i = 0;
+                      for (PDPage page : doc.getPages()) {
+                          COSDictionary res = page.getResources().getCOSObject();
+                          byte[] data;
+                          InputStream is = page.getContents();
+                          try {
+                              data = readAll(is);
+                          } finally {
+                              if (is != null) is.close();
+                          }
+                          PDStream ns = new PDStream(doc);
+                          OutputStream os = ns.createOutputStream(COSName.FLATE_DECODE);
+                          try {
+                              s.process(data, os, res, false, false, 0);
+                          } finally {
+                              os.close();
+                          }
+                          page.setContents(ns);
+                          i++;
+                          if (progress != null) progress.onPage(i, total);
+                      }
+                      if (s.result.removed() > 0) doc.save(out);
+                      return s.result;
+                  } finally {
+                      doc.close();
+                  }
+              }
+
+              // ---------------------------------------------------------------
+
+              private static final Set<String> FILL = new HashSet<String>(Arrays.asList("f", "F", "f*"));
+              private static final Set<String> STROKE = new HashSet<String>(Arrays.asList("S", "s"));
+              private static final Set<String> BOTH = new HashSet<String>(Arrays.asList("B", "B*", "b", "b*"));
+              private static final Set<String> TEXT = new HashSet<String>(Arrays.asList("Tj", "TJ", "'", "\""));
+              private static final Set<String> PROCESS = new HashSet<String>(Arrays.asList(
+                      "Cyan", "Magenta", "Yellow", "Black", "All", "None"));
+
+              private final COSName spot;
+              private final Result result = new Result();
+              private final Map<COSStream, Integer> doneForms = new IdentityHashMap<COSStream, Integer>();
+
+              private Stripper(COSName spot) {
+                  this.spot = spot;
+              }
+
+              private static int mode(boolean fill, boolean stroke, boolean clip) {
+                  if (clip) return fill ? (stroke ? 6 : 4) : (stroke ? 5 : 7);
+                  return fill ? (stroke ? 2 : 0) : (stroke ? 1 : 3);
+              }
+
+              private static COSBase deref(COSBase b) {
+                  return b instanceof COSObject ? ((COSObject) b).getObject() : b;
+              }
+
+              private static COSBase lookup(COSDictionary res, COSName category, Object name) {
+                  if (res == null || !(name instanceof COSName)) return null;
+                  COSBase d = res.getDictionaryObject(category);
+                  if (!(d instanceof COSDictionary)) return null;
+                  return ((COSDictionary) d).getDictionaryObject((COSName) name);
+              }
+
+              private void note(COSBase name) {
+                  if (name instanceof COSName) {
+                      String n = ((COSName) name).getName();
+                      if (!PROCESS.contains(n)) result.spots.add(n);
+                  }
+              }
+
+              private boolean isSpot(COSBase cs) {
+                  cs = deref(cs);
+                  if (!(cs instanceof COSArray)) return false;
+                  COSArray a = (COSArray) cs;
+                  if (a.size() < 2) return false;
+                  COSBase kind = a.getObject(0);
+                  if (COSName.SEPARATION.equals(kind)) {
+                      note(a.getObject(1));
+                      return spot.equals(a.getObject(1));
+                  }
+                  if (COSName.DEVICEN.equals(kind)) {
+                      COSBase names = a.getObject(1);
+                      boolean hit = false;
+                      if (names instanceof COSArray) {
+                          COSArray n = (COSArray) names;
+                          for (int j = 0; j < n.size(); j++) {
+                              note(n.getObject(j));
+                              if (spot.equals(n.getObject(j))) hit = true;
+                          }
+                      }
+                      return hit;
+                  }
+                  if (COSName.PATTERN.equals(kind) && a.size() == 2) return isSpot(a.getObject(1));
+                  return false;
+              }
+
+              /** content stream 하나를 읽으면서 바로 고쳐 쓴다 (메모리 절약). */
+              private void process(byte[] data, OutputStream os, COSDictionary res, boolean fs, boolean ss, int tr)
+                      throws IOException {
+                  PDFStreamParser parser = new PDFStreamParser(data);
+                  ContentStreamWriter w = new ContentStreamWriter(os);
+                  List<COSBase> operands = new ArrayList<COSBase>();
+                  Deque<int[]> stack = new ArrayDeque<int[]>();
+                  Object t;
+
+                  while ((t = parser.parseNextToken()) != null) {
+                      if (!(t instanceof Operator)) {
+                          if (t instanceof COSBase) operands.add((COSBase) t);
+                          continue;
+                      }
+                      Operator op = (Operator) t;
+                      String o = op.getName();
+                      boolean keep = true;
+
+                      if (o.equals("q")) {
+                          stack.push(new int[]{fs ? 1 : 0, ss ? 1 : 0, tr});
+                      } else if (o.equals("Q")) {
+                          if (!stack.isEmpty()) {
+                              int[] st = stack.pop();
+                              fs = st[0] == 1;
+                              ss = st[1] == 1;
+                              tr = st[2];
+                          }
+                      } else if (o.equals("cs") && !operands.isEmpty()) {
+                          fs = isSpot(lookup(res, COSName.COLORSPACE, operands.get(0)));
+                      } else if (o.equals("CS") && !operands.isEmpty()) {
+                          ss = isSpot(lookup(res, COSName.COLORSPACE, operands.get(0)));
+                      } else if (o.equals("g") || o.equals("rg") || o.equals("k")) {
+                          fs = false;
+                      } else if (o.equals("G") || o.equals("RG") || o.equals("K")) {
+                          ss = false;
+                      } else if (o.equals("Tr") && !operands.isEmpty() && operands.get(0) instanceof COSNumber) {
+                          tr = ((COSNumber) operands.get(0)).intValue();
+                      } else if (TEXT.contains(o) && (fs || ss)) {
+                          boolean fillOn = tr == 0 || tr == 2 || tr == 4 || tr == 6;
+                          boolean strokeOn = tr == 1 || tr == 2 || tr == 5 || tr == 6;
+                          int nm = mode(fillOn && !fs, strokeOn && !ss, tr >= 4);
+                          if (nm != tr) {
+                              result.text++;
+                              w.writeTokens(COSInteger.get(nm), Operator.getOperator("Tr"));
+                              for (COSBase b : operands) w.writeToken(b);
+                              w.writeTokens(op, COSInteger.get(tr), Operator.getOperator("Tr"));
+                              keep = false;
+                          }
+                      } else if ((FILL.contains(o) && fs) || (STROKE.contains(o) && ss)) {
+                          result.path++;
+                          w.writeToken(Operator.getOperator("n"));
+                          keep = false;
+                      } else if (BOTH.contains(o) && (fs || ss)) {
+                          result.path++;
+                          String fillOp = o.endsWith("*") ? "f*" : "f";
+                          String strokeOp = o.startsWith("b") ? "s" : "S";
+                          w.writeToken(Operator.getOperator(fs && ss ? "n" : (fs ? strokeOp : fillOp)));
+                          keep = false;
+                      } else if (o.equals("sh") && !operands.isEmpty()) {
+                          COSBase sh = lookup(res, COSName.SHADING, operands.get(0));
+                          if (sh instanceof COSDictionary
+                                  && isSpot(((COSDictionary) sh).getDictionaryObject(COSName.COLORSPACE))) {
+                              result.other++;
+                              keep = false;
+                          }
+                      } else if (o.equals("Do") && !operands.isEmpty()) {
+                          COSBase xo = lookup(res, COSName.XOBJECT, operands.get(0));
+                          if (xo instanceof COSStream) {
+                              COSStream st = (COSStream) xo;
+                              COSName sub = st.getCOSName(COSName.SUBTYPE);
+                              if (COSName.IMAGE.equals(sub) && st.getBoolean(COSName.IMAGE_MASK, false) && fs) {
+                                  result.other++;
+                                  keep = false;
+                              } else if (COSName.FORM.equals(sub)) {
+                                  handleForm(st, res, fs, ss, tr);
+                              }
+                          }
+                      } else if (o.equals("BI") && fs) {
+                          COSDictionary p = op.getImageParameters();
+                          if (p != null && (p.getBoolean(COSName.IMAGE_MASK, false)
+                                  || p.getBoolean(COSName.getPDFName("IM"), false))) {
+                              result.other++;
+                              keep = false;
+                          }
+                      }
+
+                      if (keep) {
+                          for (COSBase b : operands) w.writeToken(b);
+                          w.writeToken(op);
+                      }
+                      operands.clear();
+                  }
+                  for (COSBase b : operands) w.writeToken(b);
+              }
+
+              private void handleForm(COSStream form, COSDictionary parentRes, boolean fs, boolean ss, int tr)
+                      throws IOException {
+                  int bit = 1 << ((fs ? 2 : 0) + (ss ? 1 : 0));
+                  Integer seen = doneForms.get(form);
+                  int mask = seen == null ? 0 : seen;
+                  if ((mask & bit) != 0) return;
+                  doneForms.put(form, mask | bit);
+
+                  COSBase r = form.getDictionaryObject(COSName.RESOURCES);
+                  COSDictionary res = r instanceof COSDictionary ? (COSDictionary) r : parentRes;
+                  byte[] data;
+                  InputStream is = form.createInputStream();
+                  try {
+                      data = readAll(is);
+                  } finally {
+                      is.close();
+                  }
+                  ByteArrayOutputStream bos = new ByteArrayOutputStream(data.length);
+                  process(data, bos, res, fs, ss, tr);
+                  OutputStream os = form.createOutputStream(COSName.FLATE_DECODE);
+                  try {
+                      bos.writeTo(os);
+                  } finally {
+                      os.close();
+                  }
+              }
+
+              private static byte[] readAll(InputStream is) throws IOException {
+                  if (is == null) return new byte[0];
+                  ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                  byte[] buf = new byte[65536];
+                  int n;
+                  while ((n = is.read(buf)) > 0) bos.write(buf, 0, n);
+                  return bos.toByteArray();
+              }
+          }
+          EOF_FILE
+          cat > 'proj/app/src/main/res/drawable/ic_eraser.xml' << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="48dp"
+              android:height="48dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <group
+                  android:pivotX="12"
+                  android:pivotY="11"
+                  android:rotation="-35">
+                  <path
+                      android:fillColor="#FF6F87"
+                      android:pathData="M5.5,7.5h8v7h-8a1.5,1.5 0,0 1,-1.5 -1.5v-4a1.5,1.5 0,0 1,1.5 -1.5z" />
+                  <path
+                      android:fillColor="#3D7BFF"
+                      android:pathData="M13.5,7.5h5a1.5,1.5 0,0 1,1.5 1.5v4a1.5,1.5 0,0 1,-1.5 1.5h-5z" />
+              </group>
+              <path
+                  android:fillColor="#B0B4BA"
+                  android:pathData="M3,20.2h18v1.3h-18z" />
+          </vector>
+          EOF_FILE
+          cat > 'proj/app/src/main/res/drawable/ic_launcher_fg.xml' << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <group
+                  android:pivotX="54"
+                  android:pivotY="52"
+                  android:rotation="-35">
+                  <path
+                      android:fillColor="#FF6F87"
+                      android:pathData="M38,42h20v20h-20a5,5 0,0 1,-5 -5v-10a5,5 0,0 1,5 -5z" />
+                  <path
+                      android:fillColor="#3D7BFF"
+                      android:pathData="M58,42h13a5,5 0,0 1,5 5v10a5,5 0,0 1,-5 5h-13z" />
+              </group>
+              <path
+                  android:fillColor="#B0B4BA"
+                  android:pathData="M30,73h48v3h-48z" />
+          </vector>
+          EOF_FILE
+          cat > 'proj/app/src/main/res/drawable/widget_bg.xml' << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#F2FFF6EC" />
+              <corners android:radius="20dp" />
+          </shape>
+          EOF_FILE
+          cat > 'proj/app/src/main/res/layout/activity_main.xml' << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:fitsSystemWindows="true">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="24dp">
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="정답 지우개"
+                      android:textSize="28sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="6dp"
+                      android:alpha="0.7"
+                      android:text="교사용 PDF에서 정답 별색만 지워서 Download/학생용에 저장한다."
+                      android:textSize="14sp" />
+
+                  <Button
+                      android:id="@+id/pick"
+                      android:layout_width="match_parent"
+                      android:layout_height="64dp"
+                      android:layout_marginTop="24dp"
+                      android:text="PDF 고르기"
+                      android:textSize="18sp" />
+
+                  <ProgressBar
+                      android:id="@+id/bar"
+                      style="?android:attr/progressBarStyleHorizontal"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="20dp"
+                      android:visibility="gone" />
+
+                  <TextView
+                      android:id="@+id/status"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="12dp"
+                      android:lineSpacingExtra="4dp"
+                      android:textIsSelectable="true"
+                      android:textSize="15sp" />
+
+                  <Button
+                      android:id="@+id/open"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:text="결과 열기"
+                      android:visibility="gone" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="32dp"
+                      android:alpha="0.7"
+                      android:text="정답 색 이름 (보통 teacher)"
+                      android:textSize="13sp" />
+
+                  <EditText
+                      android:id="@+id/spot"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:hint="teacher"
+                      android:importantForAutofill="no"
+                      android:inputType="text"
+                      android:singleLine="true" />
+              </LinearLayout>
+          </ScrollView>
+          EOF_FILE
+          cat > 'proj/app/src/main/res/layout/widget.xml' << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@drawable/widget_bg"
+              android:gravity="center"
+              android:orientation="vertical"
+              android:padding="6dp">
+
+              <ImageView
+                  android:layout_width="36dp"
+                  android:layout_height="36dp"
+                  android:contentDescription="정답 지우기"
+                  android:src="@drawable/ic_eraser" />
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="2dp"
+                  android:maxLines="1"
+                  android:text="정답 지우기"
+                  android:textColor="#333333"
+                  android:textSize="11sp" />
+          </LinearLayout>
+          EOF_FILE
+          cat > 'proj/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml' << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_fg" />
+          </adaptive-icon>
+          EOF_FILE
+          cat > 'proj/app/src/main/res/values-night/themes.xml' << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:colorPrimary">#FF7A90</item>
+                  <item name="android:colorAccent">#FF7A90</item>
+                  <item name="android:statusBarColor">#000000</item>
+              </style>
+          </resources>
+          EOF_FILE
+          cat > 'proj/app/src/main/res/values/colors.xml' << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="icon_bg">#FFF6EC</color>
+          </resources>
+          EOF_FILE
+          cat > 'proj/app/src/main/res/values/themes.xml' << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:colorPrimary">#E8506A</item>
+                  <item name="android:colorAccent">#E8506A</item>
+                  <item name="android:statusBarColor">#FFFFFF</item>
+                  <item name="android:windowLightStatusBar">true</item>
+              </style>
+          </resources>
+          EOF_FILE
+          cat > 'proj/app/src/main/res/xml/widget_info.xml' << 'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:initialLayout="@layout/widget"
+              android:minWidth="40dp"
+              android:minHeight="40dp"
+              android:previewLayout="@layout/widget"
+              android:resizeMode="horizontal|vertical"
+              android:targetCellHeight="1"
+              android:targetCellWidth="1"
+              android:updatePeriodMillis="0"
+              android:widgetCategory="home_screen" />
+          EOF_FILE
+          cat > 'proj/build.gradle.kts' << 'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+          }
+          EOF_FILE
+          cat > 'proj/gradle.properties' << 'EOF_FILE'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF_FILE
+          cat > 'proj/settings.gradle.kts' << 'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "jeongdap"
+          include(":app")
+          EOF_FILE
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Build APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: jeongdap-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk

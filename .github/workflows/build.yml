@@ -24,8 +24,8 @@ jobs:
                   applicationId = "app.jeongdap"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.1"
               }
 
               buildTypes {
@@ -146,6 +146,7 @@ jobs:
           import android.widget.Button;
           import android.widget.EditText;
           import android.widget.ProgressBar;
+          import android.widget.RadioGroup;
           import android.widget.TextView;
           import android.widget.Toast;
 
@@ -171,6 +172,7 @@ jobs:
               private Button pick;
               private Button open;
               private EditText spot;
+              private RadioGroup modeGroup;
               private volatile Uri lastOut;
               private boolean fromWidget;
 
@@ -183,7 +185,11 @@ jobs:
                   pick = findViewById(R.id.pick);
                   open = findViewById(R.id.open);
                   spot = findViewById(R.id.spot);
+                  modeGroup = findViewById(R.id.mode);
                   spot.setText(getSharedPreferences("cfg", MODE_PRIVATE).getString("spot", "teacher"));
+                  int savedMode = getSharedPreferences("cfg", MODE_PRIVATE).getInt("mode", Stripper.AUTO);
+                  modeGroup.check(savedMode == Stripper.SPOT ? R.id.mode_spot
+                          : savedMode == Stripper.CYAN ? R.id.mode_cyan : R.id.mode_auto);
                   pick.setOnClickListener(v -> openPicker());
                   open.setOnClickListener(v -> openResult());
                   if (saved == null) handle(getIntent());
@@ -258,7 +264,10 @@ jobs:
                   }
                   String name = spot.getText().toString().trim();
                   if (name.isEmpty()) name = "teacher";
-                  getSharedPreferences("cfg", MODE_PRIVATE).edit().putString("spot", name).apply();
+                  int checked = modeGroup.getCheckedRadioButtonId();
+                  final int mode = checked == R.id.mode_spot ? Stripper.SPOT
+                          : checked == R.id.mode_cyan ? Stripper.CYAN : Stripper.AUTO;
+                  getSharedPreferences("cfg", MODE_PRIVATE).edit().putString("spot", name).putInt("mode", mode).apply();
                   busy = true;
                   lastOut = null;
                   pick.setEnabled(false);
@@ -267,10 +276,10 @@ jobs:
                   bar.setProgress(0);
                   getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                   final String spotName = name;
-                  new Thread(() -> work(uris, spotName), "eraser").start();
+                  new Thread(() -> work(uris, spotName, mode), "eraser").start();
               }
 
-              private void work(List<Uri> uris, String spotName) {
+              private void work(List<Uri> uris, String spotName, int mode) {
                   StringBuilder log = new StringBuilder();
                   File cache = getCacheDir();
                   try {
@@ -289,19 +298,26 @@ jobs:
                           InputStream is = getContentResolver().openInputStream(u);
                           if (is == null) throw new IOException("파일을 못 열었다");
                           copy(is, new FileOutputStream(in));
-                          Stripper.Result r = Stripper.run(in, out, spotName, cache,
+                          Stripper.Result r = Stripper.run(in, out, spotName, mode, cache,
                                   (d, n) -> ui(head + "\n" + d + " / " + n + "쪽", d, n));
                           if (r.removed() == 0) {
-                              log.append("✗ ").append(name).append("\n   '").append(spotName)
-                                      .append("' 색을 못 찾았다. 이 PDF의 별색: ")
-                                      .append(r.spots.isEmpty() ? "없음" : String.join(", ", r.spots))
-                                      .append("\n\n");
+                              String spots = r.spots.isEmpty() ? "없음" : String.join(", ", r.spots);
+                              log.append("✗ ").append(name).append("\n   ");
+                              if (r.cyan && mode == Stripper.AUTO) {
+                                  log.append("별색 '").append(spotName).append("'도 없고 시안(C만 들어간 파랑)으로 칠한 것도 없다.");
+                              } else if (r.cyan) {
+                                  log.append("시안(C만 들어간 파랑)으로 칠한 게 없다.");
+                              } else {
+                                  log.append("'").append(spotName).append("' 색을 못 찾았다.");
+                              }
+                              log.append(" 이 PDF의 별색: ").append(spots).append("\n\n");
                           } else {
                               ui(head + "\n저장 중…", 1, 1);
                               Uri saved = saveToDownloads(out, base + "_학생용.pdf");
                               lastOut = saved;
                               log.append("✓ ").append(base).append("_학생용.pdf\n   ")
-                                      .append(r.pages).append("쪽, 정답 ").append(r.removed()).append("곳 지움\n\n");
+                                      .append(r.pages).append("쪽, 정답 ").append(r.removed()).append("곳 지움 (")
+                                      .append(r.cyan ? "시안" : "별색 " + spotName).append(")\n\n");
                           }
                       } catch (OutOfMemoryError e) {
                           log.append("✗ ").append(name).append("\n   메모리 부족. 다른 앱 닫고 다시.\n\n");
@@ -418,8 +434,19 @@ jobs:
           import java.util.Set;
           import java.util.TreeSet;
 
-          /** 교사용 PDF에서 지정한 별색(Separation)으로 칠한 것만 지운다. */
+          /**
+           * 교사용 PDF에서 정답 잉크만 지운다.
+           * <ul>
+           *   <li>별색 모드: 지정한 별색(Separation/DeviceN)으로 칠한 것</li>
+           *   <li>시안 모드: CMYK에서 C만 들어간 색(M=Y=K=0)으로 칠한 것. 별색 없이 파란 정답을 찍은 교재용</li>
+           * </ul>
+           */
           public class Stripper {
+
+              /** 별색이 있으면 별색, 없으면 시안 */
+              public static final int AUTO = 0;
+              public static final int SPOT = 1;
+              public static final int CYAN = 2;
 
               public interface Progress {
                   void onPage(int done, int total);
@@ -427,6 +454,8 @@ jobs:
 
               public static class Result {
                   public int text, path, other, pages;
+                  /** 실제로 쓴 방식: true면 시안, false면 별색 */
+                  public boolean cyan;
                   /** PDF 안에서 본 별색 이름들 (CMYK 기본색 제외) */
                   public final Set<String> spots = new TreeSet<String>();
 
@@ -435,14 +464,22 @@ jobs:
                   }
               }
 
-              public static Result run(File in, File out, String spotName, File tempDir, Progress progress)
+              public static Result run(File in, File out, String spotName, int mode, File tempDir, Progress progress)
                       throws IOException {
-                  Stripper s = new Stripper(COSName.getPDFName(spotName));
                   MemoryUsageSetting mem = MemoryUsageSetting.setupMixed(32L * 1024 * 1024);
                   if (tempDir != null) mem.setTempDir(tempDir);
                   PDDocument doc = PDDocument.load(in, mem);
                   try {
                       doc.setAllSecurityToBeRemoved(true);
+
+                      // 먼저 어떤 별색이 있는지 훑어서 방식을 정한다 (스트림은 안 풀어서 빠르다).
+                      Stripper s = new Stripper(COSName.getPDFName(spotName), false);
+                      for (PDPage page : doc.getPages()) {
+                          if (page.getResources() != null) s.scan(page.getResources().getCOSObject());
+                      }
+                      s.cyan = mode == CYAN || (mode == AUTO && !s.spotSeen);
+                      s.result.cyan = s.cyan;
+
                       int total = doc.getNumberOfPages();
                       s.result.pages = total;
                       int i = 0;
@@ -458,7 +495,7 @@ jobs:
                           PDStream ns = new PDStream(doc);
                           OutputStream os = ns.createOutputStream(COSName.FLATE_DECODE);
                           try {
-                              s.process(data, os, res, false, false, 0);
+                              s.process(data, os, res, new State());
                           } finally {
                               os.close();
                           }
@@ -481,13 +518,39 @@ jobs:
               private static final Set<String> TEXT = new HashSet<String>(Arrays.asList("Tj", "TJ", "'", "\""));
               private static final Set<String> PROCESS = new HashSet<String>(Arrays.asList(
                       "Cyan", "Magenta", "Yellow", "Black", "All", "None"));
+              private static final COSName CAL_CMYK = COSName.getPDFName("CalCMYK");
+              private static final float EPS = 0.001f;
+
+              /** 그래픽 상태 중 필요한 것만: 지금 칠하는 색이 정답 색인지, 지금 색공간이 CMYK인지, 글자 렌더 모드 */
+              private static final class State {
+                  boolean fs, ss, fc, sc;
+                  int tr;
+
+                  State copy() {
+                      State n = new State();
+                      n.fs = fs;
+                      n.ss = ss;
+                      n.fc = fc;
+                      n.sc = sc;
+                      n.tr = tr;
+                      return n;
+                  }
+
+                  int key() {
+                      return (fs ? 8 : 0) | (ss ? 4 : 0) | (fc ? 2 : 0) | (sc ? 1 : 0);
+                  }
+              }
 
               private final COSName spot;
+              private boolean cyan;
+              private boolean spotSeen;
               private final Result result = new Result();
               private final Map<COSStream, Integer> doneForms = new IdentityHashMap<COSStream, Integer>();
+              private final Set<COSBase> scanned = java.util.Collections.newSetFromMap(new IdentityHashMap<COSBase, Boolean>());
 
-              private Stripper(COSName spot) {
+              private Stripper(COSName spot, boolean cyan) {
                   this.spot = spot;
+                  this.cyan = cyan;
               }
 
               private static int mode(boolean fill, boolean stroke, boolean clip) {
@@ -508,10 +571,70 @@ jobs:
 
               private void note(COSBase name) {
                   if (name instanceof COSName) {
+                      if (spot.equals(name)) spotSeen = true;
                       String n = ((COSName) name).getName();
                       if (!PROCESS.contains(n)) result.spots.add(n);
                   }
               }
+
+              // ---- 미리 훑기: 리소스에 어떤 별색이 있나 ----
+
+              private void scan(COSBase resBase) {
+                  COSBase r = deref(resBase);
+                  if (!(r instanceof COSDictionary) || !scanned.add(r)) return;
+                  COSDictionary res = (COSDictionary) r;
+                  for (COSBase v : values(res.getDictionaryObject(COSName.COLORSPACE))) scanCs(v, 0);
+                  for (COSBase v : values(res.getDictionaryObject(COSName.SHADING))) scanShading(v);
+                  for (COSBase v : values(res.getDictionaryObject(COSName.PATTERN))) {
+                      if (v instanceof COSDictionary) {
+                          COSDictionary p = (COSDictionary) v;
+                          scanShading(p.getDictionaryObject(COSName.SHADING));
+                          scan(p.getDictionaryObject(COSName.RESOURCES));
+                      }
+                  }
+                  for (COSBase v : values(res.getDictionaryObject(COSName.XOBJECT))) {
+                      if (!(v instanceof COSStream)) continue;
+                      COSStream x = (COSStream) v;
+                      COSName sub = x.getCOSName(COSName.SUBTYPE);
+                      if (COSName.FORM.equals(sub)) scan(x.getDictionaryObject(COSName.RESOURCES));
+                      else if (COSName.IMAGE.equals(sub)) scanCs(x.getDictionaryObject(COSName.COLORSPACE), 0);
+                  }
+              }
+
+              private void scanShading(COSBase b) {
+                  b = deref(b);
+                  if (b instanceof COSDictionary) scanCs(((COSDictionary) b).getDictionaryObject(COSName.COLORSPACE), 0);
+              }
+
+              private void scanCs(COSBase cs, int depth) {
+                  cs = deref(cs);
+                  if (!(cs instanceof COSArray) || depth > 4) return;
+                  COSArray a = (COSArray) cs;
+                  if (a.size() < 2) return;
+                  COSBase kind = a.getObject(0);
+                  if (COSName.SEPARATION.equals(kind)) {
+                      note(a.getObject(1));
+                  } else if (COSName.DEVICEN.equals(kind)) {
+                      COSBase names = a.getObject(1);
+                      if (names instanceof COSArray) {
+                          COSArray n = (COSArray) names;
+                          for (int j = 0; j < n.size(); j++) note(n.getObject(j));
+                      }
+                  } else if (COSName.INDEXED.equals(kind) || COSName.PATTERN.equals(kind)) {
+                      scanCs(a.getObject(1), depth + 1);
+                  }
+              }
+
+              private static List<COSBase> values(COSBase d) {
+                  List<COSBase> l = new ArrayList<COSBase>();
+                  d = deref(d);
+                  if (d instanceof COSDictionary) {
+                      for (COSName k : ((COSDictionary) d).keySet()) l.add(((COSDictionary) d).getDictionaryObject(k));
+                  }
+                  return l;
+              }
+
+              // ---- 색 판정 ----
 
               private boolean isSpot(COSBase cs) {
                   cs = deref(cs);
@@ -539,13 +662,42 @@ jobs:
                   return false;
               }
 
+              /** cs/CS 피연산자가 CMYK 색공간인지 (DeviceCMYK, ICC 4채널, CalCMYK) */
+              private static boolean isCmyk(COSDictionary res, COSBase operand) {
+                  if (COSName.DEVICECMYK.equals(operand)) return true;
+                  COSBase cs = deref(lookup(res, COSName.COLORSPACE, operand));
+                  if (COSName.DEVICECMYK.equals(cs)) return true;
+                  if (cs instanceof COSArray && ((COSArray) cs).size() >= 2) {
+                      COSArray a = (COSArray) cs;
+                      COSBase kind = a.getObject(0);
+                      if (CAL_CMYK.equals(kind)) return true;
+                      if (COSName.ICCBASED.equals(kind)) {
+                          COSBase icc = a.getObject(1);
+                          return icc instanceof COSDictionary && ((COSDictionary) icc).getInt(COSName.N) == 4;
+                      }
+                  }
+                  return false;
+              }
+
+              /** C만 들어간 색인지: C > 0, M = Y = K = 0 */
+              private static boolean isCyan(List<COSBase> v) {
+                  if (v.size() != 4) return false;
+                  float[] c = new float[4];
+                  for (int j = 0; j < 4; j++) {
+                      if (!(v.get(j) instanceof COSNumber)) return false;
+                      c[j] = ((COSNumber) v.get(j)).floatValue();
+                  }
+                  return c[0] > EPS && Math.abs(c[1]) <= EPS && Math.abs(c[2]) <= EPS && Math.abs(c[3]) <= EPS;
+              }
+
+              // ---- 본 처리 ----
+
               /** content stream 하나를 읽으면서 바로 고쳐 쓴다 (메모리 절약). */
-              private void process(byte[] data, OutputStream os, COSDictionary res, boolean fs, boolean ss, int tr)
-                      throws IOException {
+              private void process(byte[] data, OutputStream os, COSDictionary res, State g) throws IOException {
                   PDFStreamParser parser = new PDFStreamParser(data);
                   ContentStreamWriter w = new ContentStreamWriter(os);
                   List<COSBase> operands = new ArrayList<COSBase>();
-                  Deque<int[]> stack = new ArrayDeque<int[]>();
+                  Deque<State> stack = new ArrayDeque<State>();
                   Object t;
 
                   while ((t = parser.parseNextToken()) != null) {
@@ -558,28 +710,46 @@ jobs:
                       boolean keep = true;
 
                       if (o.equals("q")) {
-                          stack.push(new int[]{fs ? 1 : 0, ss ? 1 : 0, tr});
+                          stack.push(g.copy());
                       } else if (o.equals("Q")) {
-                          if (!stack.isEmpty()) {
-                              int[] st = stack.pop();
-                              fs = st[0] == 1;
-                              ss = st[1] == 1;
-                              tr = st[2];
-                          }
+                          if (!stack.isEmpty()) g = stack.pop();
                       } else if (o.equals("cs") && !operands.isEmpty()) {
-                          fs = isSpot(lookup(res, COSName.COLORSPACE, operands.get(0)));
+                          if (cyan) {
+                              g.fc = isCmyk(res, operands.get(0));
+                              g.fs = false; // 색공간을 바꾸면 처음 색은 검정
+                          } else {
+                              g.fs = isSpot(lookup(res, COSName.COLORSPACE, operands.get(0)));
+                          }
                       } else if (o.equals("CS") && !operands.isEmpty()) {
-                          ss = isSpot(lookup(res, COSName.COLORSPACE, operands.get(0)));
-                      } else if (o.equals("g") || o.equals("rg") || o.equals("k")) {
-                          fs = false;
-                      } else if (o.equals("G") || o.equals("RG") || o.equals("K")) {
-                          ss = false;
+                          if (cyan) {
+                              g.sc = isCmyk(res, operands.get(0));
+                              g.ss = false;
+                          } else {
+                              g.ss = isSpot(lookup(res, COSName.COLORSPACE, operands.get(0)));
+                          }
+                      } else if (o.equals("sc") || o.equals("scn")) {
+                          if (cyan && g.fc) g.fs = isCyan(operands);
+                      } else if (o.equals("SC") || o.equals("SCN")) {
+                          if (cyan && g.sc) g.ss = isCyan(operands);
+                      } else if (o.equals("k")) {
+                          g.fc = true;
+                          g.fs = cyan && isCyan(operands);
+                      } else if (o.equals("K")) {
+                          g.sc = true;
+                          g.ss = cyan && isCyan(operands);
+                      } else if (o.equals("g") || o.equals("rg")) {
+                          g.fs = false;
+                          g.fc = false;
+                      } else if (o.equals("G") || o.equals("RG")) {
+                          g.ss = false;
+                          g.sc = false;
                       } else if (o.equals("Tr") && !operands.isEmpty() && operands.get(0) instanceof COSNumber) {
-                          tr = ((COSNumber) operands.get(0)).intValue();
-                      } else if (TEXT.contains(o) && (fs || ss)) {
+                          g.tr = ((COSNumber) operands.get(0)).intValue();
+                      } else if (TEXT.contains(o) && (g.fs || g.ss)) {
+                          int tr = g.tr;
                           boolean fillOn = tr == 0 || tr == 2 || tr == 4 || tr == 6;
                           boolean strokeOn = tr == 1 || tr == 2 || tr == 5 || tr == 6;
-                          int nm = mode(fillOn && !fs, strokeOn && !ss, tr >= 4);
+                          int nm = mode(fillOn && !g.fs, strokeOn && !g.ss, tr >= 4);
                           if (nm != tr) {
                               result.text++;
                               w.writeTokens(COSInteger.get(nm), Operator.getOperator("Tr"));
@@ -587,17 +757,17 @@ jobs:
                               w.writeTokens(op, COSInteger.get(tr), Operator.getOperator("Tr"));
                               keep = false;
                           }
-                      } else if ((FILL.contains(o) && fs) || (STROKE.contains(o) && ss)) {
+                      } else if ((FILL.contains(o) && g.fs) || (STROKE.contains(o) && g.ss)) {
                           result.path++;
                           w.writeToken(Operator.getOperator("n"));
                           keep = false;
-                      } else if (BOTH.contains(o) && (fs || ss)) {
+                      } else if (BOTH.contains(o) && (g.fs || g.ss)) {
                           result.path++;
                           String fillOp = o.endsWith("*") ? "f*" : "f";
                           String strokeOp = o.startsWith("b") ? "s" : "S";
-                          w.writeToken(Operator.getOperator(fs && ss ? "n" : (fs ? strokeOp : fillOp)));
+                          w.writeToken(Operator.getOperator(g.fs && g.ss ? "n" : (g.fs ? strokeOp : fillOp)));
                           keep = false;
-                      } else if (o.equals("sh") && !operands.isEmpty()) {
+                      } else if (o.equals("sh") && !operands.isEmpty() && !cyan) {
                           COSBase sh = lookup(res, COSName.SHADING, operands.get(0));
                           if (sh instanceof COSDictionary
                                   && isSpot(((COSDictionary) sh).getDictionaryObject(COSName.COLORSPACE))) {
@@ -609,14 +779,14 @@ jobs:
                           if (xo instanceof COSStream) {
                               COSStream st = (COSStream) xo;
                               COSName sub = st.getCOSName(COSName.SUBTYPE);
-                              if (COSName.IMAGE.equals(sub) && st.getBoolean(COSName.IMAGE_MASK, false) && fs) {
+                              if (COSName.IMAGE.equals(sub) && st.getBoolean(COSName.IMAGE_MASK, false) && g.fs) {
                                   result.other++;
                                   keep = false;
                               } else if (COSName.FORM.equals(sub)) {
-                                  handleForm(st, res, fs, ss, tr);
+                                  handleForm(st, res, g);
                               }
                           }
-                      } else if (o.equals("BI") && fs) {
+                      } else if (o.equals("BI") && g.fs) {
                           COSDictionary p = op.getImageParameters();
                           if (p != null && (p.getBoolean(COSName.IMAGE_MASK, false)
                                   || p.getBoolean(COSName.getPDFName("IM"), false))) {
@@ -634,9 +804,8 @@ jobs:
                   for (COSBase b : operands) w.writeToken(b);
               }
 
-              private void handleForm(COSStream form, COSDictionary parentRes, boolean fs, boolean ss, int tr)
-                      throws IOException {
-                  int bit = 1 << ((fs ? 2 : 0) + (ss ? 1 : 0));
+              private void handleForm(COSStream form, COSDictionary parentRes, State g) throws IOException {
+                  int bit = 1 << g.key();
                   Integer seen = doneForms.get(form);
                   int mask = seen == null ? 0 : seen;
                   if ((mask & bit) != 0) return;
@@ -652,7 +821,7 @@ jobs:
                       is.close();
                   }
                   ByteArrayOutputStream bos = new ByteArrayOutputStream(data.length);
-                  process(data, bos, res, fs, ss, tr);
+                  process(data, bos, res, g.copy());
                   OutputStream os = form.createOutputStream(COSName.FLATE_DECODE);
                   try {
                       bos.writeTo(os);
@@ -749,7 +918,7 @@ jobs:
                       android:layout_height="wrap_content"
                       android:layout_marginTop="6dp"
                       android:alpha="0.7"
-                      android:text="교사용 PDF에서 정답 별색만 지워서 Download/학생용에 저장한다."
+                      android:text="교사용 PDF에서 정답 색만 지워서 Download/학생용에 저장한다."
                       android:textSize="14sp" />
 
                   <Button
@@ -790,7 +959,40 @@ jobs:
                       android:layout_height="wrap_content"
                       android:layout_marginTop="32dp"
                       android:alpha="0.7"
-                      android:text="정답 색 이름 (보통 teacher)"
+                      android:text="정답 색 찾는 방법"
+                      android:textSize="13sp" />
+
+                  <RadioGroup
+                      android:id="@+id/mode"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:orientation="vertical">
+
+                      <RadioButton
+                          android:id="@+id/mode_auto"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="자동 (별색이 있으면 별색, 없으면 시안)" />
+
+                      <RadioButton
+                          android:id="@+id/mode_spot"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="별색만" />
+
+                      <RadioButton
+                          android:id="@+id/mode_cyan"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="시안만 (C만 들어간 파랑)" />
+                  </RadioGroup>
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:alpha="0.7"
+                      android:text="정답 별색 이름 (보통 teacher)"
                       android:textSize="13sp" />
 
                   <EditText
